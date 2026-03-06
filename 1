@@ -1,0 +1,15 @@
+from google.colab import files
+import pandas as pd
+import io
+
+# رفع الملفات
+print("قم برفع ملف TADPOLE_D1_D2.csv الآن:")
+uploaded = files.upload()
+
+# قراءة الملف
+file_name = list(uploaded.keys())[0]
+df = pd.read_csv(io.BytesIO(uploaded[file_name]), low_memory=False)
+print(f"✅ تم تحميل الملف بنجاح: {file_name}")
+
+
+df = pd.read_csv("TADPOLE_D1_D2.csv")
