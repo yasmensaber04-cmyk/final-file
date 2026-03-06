@@ -1,0 +1,14 @@
+import numpy as np
+
+# مثال على مصفوفة الانتباه (patients x visits)
+attn_matrix = np.random.rand(20, 3)  # 20 مريض، 3 زيارات لكل مريض
+rids = [f"RID_{i}" for i in range(1, 21)]
+
+plt.figure(figsize=(10,6))
+sns.heatmap(attn_matrix, annot=True, cmap="YlOrRd",
+            xticklabels=[f"Visit {i+1}" for i in range(attn_matrix.shape[1])],
+            yticklabels=rids)
+plt.xlabel("Visit")
+plt.ylabel("Patient RID")
+plt.title("Attention Weights - First 20 Patients")
+plt.show()
