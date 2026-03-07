@@ -206,6 +206,7 @@ def main():
             optimizer.step()
             total_loss+=loss.item()
         avg_loss = total_loss/len(train_loader)
+        
 
         # Validation
         model.eval()
@@ -250,6 +251,29 @@ def main():
     # Ensemble
     ens_preds, ens_probs = ensemble_predictions(lstm_probs,xgb_probs,lstm_weight=0.5)
 
+        # ================================
+    # تقييم كل موديل لوحده + الدمج
+    # ================================
+
+    print("\n📊 REPORT FOR: BI-LSTM + Attention")
+    print(classification_report(y_test_seq.numpy(), lstm_preds, target_names=['CN','MCI','AD']))
+    print("✅ Accuracy:", accuracy_score(y_test_seq.numpy(), lstm_preds))
+    print("✅ Cohen Kappa:", cohen_kappa_score(y_test_seq.numpy(), lstm_preds))
+    print("✅ MCC:", matthews_corrcoef(y_test_seq.numpy(), lstm_preds))
+
+    print("\n📊 REPORT FOR: XGBoost")
+    print(classification_report(y_test_seq.numpy(), xgb_preds, target_names=['CN','MCI','AD']))
+    print("✅ Accuracy:", accuracy_score(y_test_seq.numpy(), xgb_preds))
+    print("✅ Cohen Kappa:", cohen_kappa_score(y_test_seq.numpy(), xgb_preds))
+    print("✅ MCC:", matthews_corrcoef(y_test_seq.numpy(), xgb_preds))
+
+    print("\n📊 REPORT FOR: Ensemble (LSTM 0.5 + XGB 0.5)")
+    print(classification_report(y_test_seq.numpy(), ens_preds, target_names=['CN','MCI','AD']))
+    print("✅ Accuracy:", accuracy_score(y_test_seq.numpy(), ens_preds))
+    print("✅ Cohen Kappa:", cohen_kappa_score(y_test_seq.numpy(), ens_preds))
+    print("✅ MCC:", matthews_corrcoef(y_test_seq.numpy(), ens_preds))
+
+
     # Metrics
     print("\nClassification Report (Ensemble):")
     print(classification_report(y_test_seq.numpy(),ens_preds,target_names=['CN','MCI','AD'],zero_division=0))
@@ -268,3 +292,4 @@ def main():
 
 if __name__=="__main__":
     main()
+
