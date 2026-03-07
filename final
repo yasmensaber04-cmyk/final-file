@@ -1,0 +1,195 @@
+import numpy as np
+import pandas as pd
+import torch, torch.nn as nn
+import xgboost as xgb
+import optuna, joblib, warnings
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import accuracy_score, f1_score, matthews_corrcoef
+from pathlib import Path
+
+warnings.filterwarnings('ignore')
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+Path("models").mkdir(exist_ok=True)
+
+# ===================== 1️⃣ Advanced Preprocessing =====================
+def advanced_preprocess(df):
+    base_features = ["AGE","PTGENDER","APOE4","CDRSB","ADAS11","ADAS13","MMSE","FAQ",
+                     "Ventricles","Hippocampus","WholeBrain","Entorhinal","ICV",
+                     "ABETA_UPENNBIOMK9_04_19_17","TAU_UPENNBIOMK9_04_19_17","PTAU_UPENNBIOMK9_04_19_17"]
+    df["PTGENDER"] = df["PTGENDER"].map({"Male":0,"Female":1,"M":0,"F":1}).fillna(0)
+    diag_map = {"CN":0,"NL":0,"SMC":0,"MCI":1,"EMCI":1,"LMCI":1,"AD":2,"Dementia":2}
+    df["label"] = df["DX"].map(diag_map).fillna(df["DX_bl"].map(diag_map))
+    df = df.dropna(subset=["label"])
+    for col in base_features:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df[base_features] = df[base_features].fillna(df[base_features].median())
+    
+    # Derived features
+    df["Bio_Interaction"] = df["ABETA_UPENNBIOMK9_04_19_17"] * df["TAU_UPENNBIOMK9_04_19_17"] * df["PTAU_UPENNBIOMK9_04_19_17"]
+    df["Hipp_Ventricles_Ratio"] = df["Hippocampus"] / (df["Ventricles"] + 1e-6)
+    
+    for f in ["MMSE","ADAS13","CDRSB"]:
+        df[f+"_slope"] = df.groupby("RID")[f].diff().fillna(0).cumsum()
+    
+    derived = ["Bio_Interaction","Hipp_Ventricles_Ratio","MMSE_slope","ADAS13_slope","CDRSB_slope"]
+    final_features = base_features + derived
+    
+    # Save scaler once
+    scaler = StandardScaler()
+    df[final_features] = scaler.fit_transform(df[final_features])
+    joblib.dump(scaler, "models/scaler.pkl")
+    
+    return df, final_features
+
+# ===================== 2️⃣ Create sequences =====================
+def create_sequences(df, features, horizon=2.0, seq_len=6, augment=False):
+    X, y = [], []
+    for rid, group in df.groupby("RID"):
+        group = group.sort_values("Years_bl")
+        for i in range(len(group)):
+            t0 = group.iloc[i]["Years_bl"]
+            future = group[group["Years_bl"] >= t0 + horizon]
+            if not future.empty:
+                seq = group.iloc[:i+1][features].values[-seq_len:]
+                if len(seq) < seq_len:
+                    pad = np.tile(seq[0], (seq_len-len(seq), 1))
+                    seq = np.vstack([pad, seq])
+                if augment:
+                    seq += np.random.normal(0, 0.01, seq.shape)
+                X.append(seq)
+                y.append(int(future.iloc[0]["label"]))
+    return torch.tensor(np.array(X), dtype=torch.float32), torch.tensor(y, dtype=torch.long)
+
+# ===================== 3️⃣ Multi-Head Attention =====================
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model, n_heads=8):
+        super().__init__()
+        self.n_heads, self.d_k = n_heads, d_model // n_heads
+        self.q, self.k, self.v = nn.Linear(d_model,d_model), nn.Linear(d_model,d_model), nn.Linear(d_model,d_model)
+        self.fc = nn.Linear(d_model,d_model)
+    def forward(self, x):
+        B,T,D = x.shape
+        Q = self.q(x).view(B,T,self.n_heads,self.d_k).transpose(1,2)
+        K = self.k(x).view(B,T,self.n_heads,self.d_k).transpose(1,2)
+        V = self.v(x).view(B,T,self.n_heads,self.d_k).transpose(1,2)
+        attn = torch.softmax(torch.matmul(Q,K.transpose(-2,-1))/np.sqrt(self.d_k), dim=-1)
+        out = torch.matmul(attn,V).transpose(1,2).contiguous().view(B,T,D)
+        return self.fc(out), attn
+
+# ===================== 4️⃣ LSTM Model =====================
+class AlzheimerLSTM(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim,256,num_layers=2,batch_first=True,bidirectional=True,dropout=0.5)
+        self.attention = MultiHeadAttention(512,n_heads=8)
+        self.norm = nn.LayerNorm(512)
+        self.classifier = nn.Sequential(nn.Linear(512,128), nn.BatchNorm1d(128), nn.ReLU(), nn.Dropout(0.5), nn.Linear(128,3))
+    def forward(self, x):
+        lstm_out,_ = self.lstm(x)
+        attn_out, weights = self.attention(lstm_out)
+        context = torch.mean(attn_out, dim=1)
+        return self.classifier(self.norm(context)), weights
+
+# ===================== 5️⃣ Meta Learner =====================
+class MetaLearner(nn.Module):
+    def __init__(self): super().__init__(); self.net = nn.Sequential(nn.Linear(6,64),nn.ReLU(),nn.Linear(64,32),nn.ReLU(),nn.Linear(32,3))
+    def forward(self,x): return self.net(x)
+
+# ===================== 6️⃣ XGBoost Objective with Validation =====================
+def objective(trial, X_train, y_train):
+    # Split Train for internal validation
+    X_tr, X_val, y_tr, y_val = train_test_split(X_train, y_train, test_size=0.2, stratify=y_train, random_state=42)
+    param = {
+        'n_estimators': trial.suggest_int('n_estimators',100,400),
+        'max_depth': trial.suggest_int('max_depth',3,10),
+        'learning_rate': trial.suggest_float('learning_rate',0.01,0.1),
+        'subsample': trial.suggest_float('subsample',0.5,1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree',0.5,1.0),
+        'objective':'multi:softprob', 'num_class':3
+    }
+    model = xgb.XGBClassifier(**param)
+    model.fit(X_tr, y_tr)
+    preds = model.predict(X_val)
+    return matthews_corrcoef(y_val, preds) # Use MCC for imbalanced data
+
+# ===================== 7️⃣ Run Full Pipeline =====================
+def run_pipeline():
+    df, features = advanced_preprocess(pd.read_csv("TADPOLE_D1_D2.csv"))
+    horizons = [2.0,3.0]
+    rids = df["RID"].unique()
+    rid_labels = df.groupby("RID")["label"].last().values
+    skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    
+    for fold, (train_idx,test_idx) in enumerate(skf.split(rids,rid_labels)):
+        print(f"\n🌀 --- FOLD {fold+1} ---")
+        tr_rids, te_rids = rids[train_idx], rids[test_idx]
+        results_fold = {}
+        
+        for horizon in horizons:
+            X_train, y_train = create_sequences(df[df["RID"].isin(tr_rids)], features, horizon=horizon, augment=True)
+            X_test, y_test = create_sequences(df[df["RID"].isin(te_rids)], features, horizon=horizon, augment=False)
+            
+            # --- LSTM Training ---
+            lstm = AlzheimerLSTM(len(features)).to(DEVICE)
+            opt = torch.optim.AdamW(lstm.parameters(), lr=0.001)
+            criterion = nn.CrossEntropyLoss()
+            loader = DataLoader(TensorDataset(X_train, y_train), batch_size=32, shuffle=True)
+            best_loss, patience = float('inf'),0
+            for epoch in range(50):
+                lstm.train(); epoch_loss=0
+                for bx,by in loader:
+                    bx,by = bx.to(DEVICE), by.to(DEVICE)
+                    opt.zero_grad()
+                    logits,_ = lstm(bx)
+                    loss = criterion(logits,by)
+                    loss.backward(); opt.step(); epoch_loss += loss.item()
+                avg_loss = epoch_loss/len(loader)
+                if avg_loss<best_loss: best_loss=avg_loss; patience=0; torch.save(lstm.state_dict(), f"models/lstm_fold{fold}_h{int(horizon)}.pt")
+                else: patience+=1; 
+                if patience>=5: break
+            
+            # --- XGBoost Training with Optuna ---
+            study = optuna.create_study(direction='maximize')
+            study.optimize(lambda t: objective(t,X_train[:,-1,:].numpy(),y_train.numpy()), n_trials=10)
+            xgb_model = xgb.XGBClassifier(**study.best_params).fit(X_train[:,-1,:].numpy(),y_train.numpy())
+            
+            # --- Meta-Learner Training ---
+            lstm.load_state_dict(torch.load(f"models/lstm_fold{fold}_h{int(horizon)}.pt")); lstm.eval()
+            with torch.no_grad(): l_prob,_ = lstm(X_train.to(DEVICE)); l_prob = torch.softmax(l_prob,dim=1).cpu().numpy()
+            x_prob = xgb_model.predict_proba(X_train[:,-1,:].numpy())
+            meta_X = torch.tensor(np.concatenate([l_prob,x_prob],axis=1),dtype=torch.float32).to(DEVICE)
+            meta = MetaLearner().to(DEVICE); m_opt = torch.optim.Adam(meta.parameters(), lr=0.01)
+            for _ in range(50):
+                m_opt.zero_grad(); nn.CrossEntropyLoss()(meta(meta_X),y_train.to(DEVICE)).backward(); m_opt.step()
+            
+            # --- Evaluation ---
+            lstm.eval(); meta.eval()
+            with torch.no_grad():
+                l_te,_ = lstm(X_test.to(DEVICE)); l_te = torch.softmax(l_te,dim=1).cpu().numpy()
+                x_te = xgb_model.predict_proba(X_test[:,-1,:].numpy())
+                meta_in = torch.tensor(np.concatenate([l_te,x_te],axis=1),dtype=torch.float32).to(DEVICE)
+                meta_preds = torch.argmax(meta(meta_in),axis=1).cpu().numpy()
+                
+                results_fold[horizon] = {
+                    "LSTM": {"Acc": accuracy_score(y_test, np.argmax(l_te,axis=1)), 
+                             "F1": f1_score(y_test, np.argmax(l_te,axis=1),average='weighted'),
+                             "MCC": matthews_corrcoef(y_test, np.argmax(l_te,axis=1))},
+                    "XGB": {"Acc": accuracy_score(y_test, np.argmax(x_te,axis=1)),
+                            "F1": f1_score(y_test, np.argmax(x_te,axis=1),average='weighted'),
+                            "MCC": matthews_corrcoef(y_test, np.argmax(x_te,axis=1))},
+                    "Meta": {"Acc": accuracy_score(y_test, meta_preds),
+                             "F1": f1_score(y_test, meta_preds,average='weighted'),
+                             "MCC": matthews_corrcoef(y_test, meta_preds)}
+                }
+        
+        # --- Print Results per Horizon ---
+        for h in horizons:
+            print(f"\n⏳ Horizon: {int(h)}y")
+            for model_name in ["LSTM","XGB","Meta"]:
+                metrics = results_fold[h][model_name]
+                print(f"▶ {model_name} | Acc: {metrics['Acc']:.4f} | F1: {metrics['F1']:.4f} | MCC: {metrics['MCC']:.4f}")
+
+if __name__=="__main__":
+    run_pipeline()
